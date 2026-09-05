@@ -63,19 +63,18 @@
 ## 三、整体架构
 
 ```
-cron（每3分钟）──► monitor.sh ──► 检测断线（外网 200）
+cron（每3分钟）──► monitor.sh ──► 检测断线（ICMP 直连公网）
                                      │ 断线
                                      ▼
                               login.js（Node + CDP）
                    ┌──────────────────────────────────┐
-                   │ 1. 释放内存（停高占用服务）     │
+                   │ 1. 清理环境（清 profile/会话）   │
                    │ 2. 启动 single-process Chromium   │
-                   │ 3. CDP 打开门户页（瑞数 WAF 握手）│
-                   │ 4. 进入 unionautologin 登录 iframe│
-                   │ 5. canvas 抓取验证码 → tesseract  │
-                   │ 6. 填表提交（账号/密码/验证码）    │
-                   │ 7. 校验结果（登录成功/失败）       │
-                   │ 8. 恢复服务                       │
+                   │ 3. 首次直访 unionautologin.do     │
+                   │    （瑞数 WAF 握手 → 表单渲染）    │
+                   │ 4. canvas 抓取验证码 → tesseract  │
+                   │ 5. 填表提交（账号/密码/验证码）    │
+                   │ 6. 校验结果（登录成功/失败）       │
                    └──────────────────────────────────┘
 ```
 
@@ -84,29 +83,28 @@ cron（每3分钟）──► monitor.sh ──► 检测断线（外网 200）
 ```mermaid
 flowchart TD
     C[cron 每 3 分钟] --> M[monitor.sh]
-    M --> Q{百度探测返回 200?}
+    M --> Q{ICMP 直连公网是否可达?}
     Q -- 是 --> X[已在线，退出]
     Q -- 否 --> G[获取 WAN IP]
     G --> L[node login.js]
-    L --> F[释放内存（停高占用服务）]
+    L --> F[清理环境<br/>清 cookie/profile]
     F --> B[启动 single-process Chromium]
-    B --> H[CDP 打开门户<br/>瑞数 WAF 握手]
-    H --> I[进入 unionautologin iframe]
+    B --> H[首次直访登录页<br/>瑞数 WAF 握手]
+    H --> I[登录表单渲染<br/>进入表单页顶层 document]
     I --> V[canvas 抓验证码]
     V --> O[tesseract OCR 多 psm 投票]
     O --> S[填表提交 账号/密码/验证码]
     S --> R{校验结果}
     R -- 成功 --> K[在线]
-    R -- 验证码错/失败 --> A[刷新重试 ≤4 次]
+    R -- 验证码错/失败 --> A[清 cookie 重访登录页<br/>换验证码重试 ≤4 次]
     A --> V
-    L --> E[恢复服务]
 ```
 
 - **monitor.sh**：负责"检测 → 触发"，由 cron 每 3 分钟执行
 - **login.js**：负责"登录全流程"，Node.js 通过 CDP 驱动 Chromium，OCR 识别验证码
 
 **原理说明**：
-- **为什么用外网探测判在线**：`curl https://www.baidu.com` 能通 = 认证已通过（未认证时流量会被 Portal 重定向，探测不会返回 200）。用外网而非校园网内网地址，避免"能上内网但未认证"的误判
+- **为什么用 ICMP 直连探测判在线**：`curl` 探测外网时流量会被路由器上的代理软件（如 openclash）接管，校园网真实掉线时探测仍可能返回 200，造成"假在线"。ICMP（ping）不被代理劫持，走内核真实路径，掉线时全 loss、在线时畅通；多个公网 IP 轮流探测避免单点误判
 - **WAN IP 为什么必须实时获取**：认证提交需要携带当前 `wlanuserip`，而 CGN 地址每次拨号可能变化，所以登录前必须现取现用
 - **为什么整套逻辑放路由器**：路由器固定联网、是流量出口，天然适合"检测-重连"；cron 每 3 分钟轮询，登录脚本在自身进程内完成 Chromium 完整生命周期（不受 SSH 会话影响）
 
@@ -120,22 +118,20 @@ sequenceDiagram
     participant ch as Chromium(CDP)
     participant ocr as tesseract
     cron->>mon: 每 3 分钟执行
-    mon->>mon: curl 百度探测在线
+    mon->>mon: ICMP 直连公网探测
     alt 已在线
         mon-->>cron: 退出
     else 断线
         mon->>js: node login.js <WAN_IP>
-        js->>js: 释放内存（停高占用服务）
+        js->>js: 清 cookie/profile、释放内存
         js->>ch: 启动 headless Chromium
-        js->>ch: Page.navigate 打开门户
-        ch-->>js: 瑞数握手通过，取到 iframe
-        js->>ch: 导航到 unionautologin iframe
+        js->>ch: 首次直访 unionautologin.do（无 cookie）
+        ch-->>js: 瑞数握手 → JS 自动重试 → 表单渲染
         js->>ch: canvas 抓验证码
         js->>ocr: tesseract 识别
         ocr-->>js: 4 位数字
         js->>ch: 填表提交（账号/密码/验证码）
         ch-->>js: 登录结果
-        js->>js: 恢复服务
     end
 ```
 
@@ -290,12 +286,20 @@ login.js 用 Node.js 写，依赖 `ws` 模块（CDP WebSocket 客户端）、`ch
 - 用 `Page.navigate` 让 Chromium **真正加载页面**（而不是 fetch/模拟请求），瑞数 JS 有完整生命周期执行、生成并写入动态 cookie
 - 等瑞数 JS 执行完成（拿到 cookie）后，再进入登录流程
 
-**④ 处理 frameset + iframe 结构**
-- Portal 首页是 `frameset`，登录表单在 iframe `unionautologin.do` 中
-- 顶层页面负责瑞数握手（生成 cookie），iframe 表单提交复用同一份动态 cookie
-- 流程：导航到门户 → 等 frameset 出现 → 读 iframe 的 `src`（含 `unionautologin`）→ 再导航到 iframe → 等登录表单渲染
+**④ 直接首访登录页（关键，v3 实测）**
+- 登录表单页 `unionautologin.do` 的 URL 参数（`brasip`、`redirectUrl` 等）在门户响应中恒定，可直接拼装
+- 流程：**清空 cookie → 首次直接导航 `unionautologin.do`** → 返回 202 握手页 → 页面内瑞数 JS 自动重试 → 200 渲染登录表单
+- 注意：**不能先访问门户首页再跳转 iframe**。先访问首页会建立"脏会话"，之后该会话内的所有后续请求（iframe、fetch、甚至导航）都会被瑞数以 400 拒绝——因为动态 cookie 与请求签名的指纹校验失败时，瑞数直接返回 400 空页
+- 首页 `frameset` 中的 iframe `src` 只是用来**提取登录页 URL 参数**作为参考；提交与验证码操作都在登录页自身的顶层 document 进行（同源，无跨域限制）
 
-**⑤ 与真实浏览器行为一致**
+**⑤ 不注入 stealth 脚本（关键，v3 实测）**
+- 不要用 `Page.addScriptToEvaluateOnNewDocument` 改写 `navigator.webdriver`/`plugins` 等属性：自定义 getter 会改变属性描述符，瑞数高级检测反而更容易识别（登录页会停在空壳、不渲染表单）。**干净的直接导航反而能通过**
+- 用 `--disable-blink-features=AutomationControlled` 启动参数消除 webdriver 自动化特征即可
+
+**⑥ 每次登录清 cookie + profile**
+- 瑞数动态 cookie 绑定会话且一次性：登录前清空 cookie、删除 Chromium profile（`rm -rf`），复用旧 `JSESSIONID`/`FSSBBI` cookie 会被直接拒绝（页面停在 202/400 空壳，无登录表单）
+
+**⑦ 与真实浏览器行为一致**
 - 先用真实浏览器完整走通登录流程（确认表单字段、验证码、提交逻辑、双密码字段），再把同一套逻辑搬到路由器的 headless Chromium，行为一致才能通过校验
 
 ### 4. 握手时序（完整生命周期）
@@ -307,8 +311,8 @@ login.js 用 Node.js 写，依赖 `ws` 模块（CDP WebSocket 客户端）、`ch
    - JS 先做**环境自检**：判断是否真实浏览器、是否被自动化控制（见上文 1-③/1-④）
    - 自检通过后，基于**时间戳 + 访问 IP + 随机数 + 环境特征**计算动态 cookie（`FSSBBIl1UgzbN7NS/NT`），通过 `document.cookie` 写入
    - 部分版本会触发**一次自动重载**：带新 cookie 重新请求页面，让服务端确认 cookie 有效
-3. 页面正常渲染；此后**同一会话的所有请求**（iframe、表单提交）都携带这组动态 cookie
-4. 本项目用 `Page.navigate` 触发完整生命周期，然后**轮询等待关键元素出现**（frameset 里的 iframe / 登录表单的验证码 img）——出现即说明 WAF 校验已通过，才继续操作
+3. 页面正常渲染；此后**同一会话的所有后续请求**都会被校验（动态 cookie 与请求签名、指纹绑定，校验失败即 400）
+4. 本项目直接导航登录页触发完整生命周期，然后**轮询等待关键元素出现**（登录表单的验证码 img）——出现即说明 WAF 校验已通过，才继续操作
 
 **握手时序图**：
 
@@ -317,24 +321,24 @@ sequenceDiagram
     participant J as login.js
     participant C as Chromium(CDP)
     participant P as Portal(瑞数WAF)
-    J->>C: Page.navigate 打开门户
-    C->>P: 首次请求
-    P-->>C: 返回 HTML + 注入瑞数混淆 JS
+    J->>C: 清空 cookie + Page.navigate 登录页
+    C->>P: 首次请求（无 cookie）
+    P-->>C: 返回 202 握手页 + 注入瑞数混淆 JS
     C->>C: 执行瑞数 JS（环境自检、生成动态 cookie）
-    C->>P: 自动重载（携带动态 cookie）
-    P-->>C: 校验通过，正常渲染页面
-    C-->>J: 取到 unionautologin iframe
-    J->>C: 导航到登录 iframe
-    C-->>J: 登录表单渲染（验证码 img 出现）
+    C->>P: JS 自动重试（携带动态 cookie）
+    P-->>C: 校验通过，200 渲染登录表单
+    C-->>J: 验证码 img 出现
+    J->>C: canvas 抓验证码 → OCR → 填表提交
 ```
 
 ### 5. 更细的绕过要点（实测）
 
 - **headless=new 模式**：Chrome 的新 headless 用完整渲染管线（真实 compositor / 网络栈），比老 `--headless` 更接近真机，瑞数更难分辨
-- **只调用 Page / Runtime 两个 CDP 域**：全程只用 `Page.navigate`、`Page.enable`、`Runtime.evaluate`，不注入额外 JS、不改 DOM、不碰 DevTools 其他域，尽量缩小可被检测的行为面
-- **等待靠"元素出现"而非固定延时**：瑞数 JS 执行速度受设备性能影响，用轮询等待关键 DOM（iframe、验证码 img）出现，确保 JS 完成后再操作
+- **CDP 域用最少**：登录页流程只需要 `Page`、`Runtime`、`Network`（清 cookie）三个域。**不要用 `addScriptToEvaluateOnNewDocument` 注入 stealth**（实测反而被识别，见"绕过细节 ⑤"）
+- **等待靠"元素出现"而非固定延时**：瑞数 JS 自动重试耗时约 3~10 秒（受设备性能影响），用轮询等待验证码 img 出现，确保 JS 完成后再操作
 - **验证码只读不 fetch**：直接 canvas 绘制页面上已有的 `<img>`，不重新请求图片 URL，避免换码（详见"八、验证码识别"）
 - **UA 保持一致**：实测即便 UA 声明的平台与实际运行环境不完全一致也能通过（瑞数主要校验 JS 环境而非 UA 字符串），但保持常规浏览器 UA 更稳妥
+- **登录前清空 cookie + 清 profile**：见"绕过细节 ⑥"，复用旧会话 cookie 会直接 400
 
 ### 6. 反制与失效风险
 
@@ -345,8 +349,7 @@ sequenceDiagram
 ### 7. 如何确认 WAF 已通过（诊断）
 
 - 页面响应不再是 400（正常 200）
-- `document.querySelector('frame')` 能取到 `src` 含 `unionautologin` 的 iframe
-- iframe 内 `getElementById('randomimage')`（验证码）存在且 `naturalWidth > 0`，说明登录表单已真实渲染
+- 登录页（`unionautologin.do`）顶层 `document.getElementById('randomimage')`（验证码）存在且 `naturalWidth > 0`，说明登录表单已真实渲染（v3 直接在登录页顶层 document 操作，不再依赖门户首页 frameset/iframe）
 
 > 小结：绕过的本质不是"欺骗"瑞数，而是**提供一个它认为是真实浏览器的完整环境**。瑞数检测自动化靠"环境指纹 + 行为一致性"，只要用的是干净的真实内核、走正常页面生命周期、不暴露自动化痕迹，就能通过。
 
@@ -582,9 +585,9 @@ cd /root/campus && node login.js <WAN_IP> --dry
 **环境**：OpenWrt，Chrome/150.0.7871.181，tesseract 5.4.1，node + ws。
 
 1. **根因定位**：低内存下 Chromium 启动卡死在 `blk_mq_get_tag`（swap+I/O 风暴），通过内核栈确认
-2. **解法**：登录前释放高占用服务内存（~90MB，MemAvailable 90→222MB）+ `--single-process` 单进程模式
+2. **解法**：登录前清 profile/缓存 + `--single-process` 单进程模式（v3 起不再停代理服务——登录页为 IP 直连，代理不劫持，详见"绕过细节"）
 3. **Chromium CDP 就绪**：`{"Browser": "Chrome/150.0.7871.181"}`
-4. **瑞数 WAF 握手通过**：成功获取登录 iframe（`unionautologin.do`）
+4. **瑞数 WAF 握手通过**：首次直访登录页渲染出验证码表单（`unionautologin.do`）
 5. **真实登录成功**（cron 自动触发）：
    ```
    识别验证码: 3959
@@ -593,7 +596,24 @@ cd /root/campus && node login.js <WAN_IP> --dry
    结果: ok
    LOGIN_OK   (登录脚本退出码=0)
    ```
-6. **当前状态**：登录后已在线，服务正常恢复
+6. **当前状态**：登录后已在线，服务正常
+7. **2026-09-05 断线自愈修复记录**（重新完整跑通）：
+   - **发现**：某次掉线后自动登录反复失败、网络长时间未恢复，新增的失败现场日志定位到"登录页停留 202 空壳"
+   - **三个根因**（已全部修复，细节见"六、瑞数 WAF 原理与绕过细节"）：
+     1. 误加 stealth 注入（改写 `navigator` 属性）→ 被瑞数识别，登录页不渲染 → **去掉即可**
+     2. 先访问门户首页建立"脏会话" → 后续所有请求被 400 → **改为清 cookie 后首次直访登录页**
+     3. 登录前停 openclash → procd 复活/进程互杀导致 Chromium 崩溃(socket hang up) → **IP 直连无需停服，砍掉该逻辑**
+   - **修复后真实日志**（手动触发完整登录）：
+     ```
+     打开登录页: http://218.200.239.185:8888/portalserver/user/unionautologin.do?...
+     登录表单已渲染，验证码就绪
+     识别验证码: 6447
+     提交: submitted
+     resp[0]: |TITLE:登录成功
+     结果: ok
+     LOGIN_OK
+     ```
+   - **修复后自愈闭环**：monitor 每 3 分钟 ICMP 真实判定掉线 → 触发 v3 登录 → 一次成功在线
 
 **真实运行痕迹**（路由器端 headless Chromium 通过 CDP 抓取的验证码，证明整套流程真实跑通）：
 
@@ -605,7 +625,7 @@ cd /root/campus && node login.js <WAN_IP> --dry
 
 ## 十一、已知限制与注意事项
 
-- **内存临界**：内存被系统服务占满时 Chromium 起不来。登录前必须释放内存（login.js 已自动处理，登录完自动恢复服务，期间短暂无其他服务）
+- **内存临界**：内存被系统服务占满时 Chromium 起不来。登录前清 profile/缓存腾内存；若实际环境内存紧张，可在 `MEM_SERVICES` 配置登录前暂停高占用服务、登录后恢复（脚本已支持，默认关闭）
 - **瑞数 WAF**：必须真实浏览器环境（本方案用 headless Chromium），纯 curl 无法通过动态 cookie 校验
 - **验证码 OCR**：纯数字识别优先（psm 7/8/13 投票），失败自动刷新重试，最多 4 次；仍失败则本次放弃，等下次 cron 重试
 - **WAN IP 变化**：登录需要当前 WAN IP（monitor.sh 自动获取）

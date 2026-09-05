@@ -10,10 +10,18 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
-# 1) 在线检测：百度返回 200 视为已联网
-if curl -s -m 8 -o /dev/null -w '%{http_code}' https://www.baidu.com 2>/dev/null | grep -q '200'; then
-  exit 0
-fi
+# 1) 在线检测
+#    说明：curl 探测外网时流量会被 openclash（redir-host 模式）接管，
+#    校园网真实掉线时探测仍可能返回 200，造成"假在线"导致长时间不自愈。
+#    ICMP（ping）不被 mihomo 劫持，走内核真实路径：掉线时全 loss、在线时畅通。
+#    轮流 ping 多个公网 IP（阿里/腾讯公共 DNS），任一可达即视为在线，避免单点误判。
+#    注意：若 openclash 改用 TUN 模式（ICMP 也被代理），请换回其他探测方式。
+for _ping_ip in 223.5.5.5 119.29.29.29; do
+  if ping -q -c 3 -W 2 "$_ping_ip" >/dev/null 2>&1; then
+    exit 0
+  fi
+done
+echo "$(date '+%F %T') 公网 ping 全失败（223.5.5.5 / 119.29.29.29），判定掉线" >> $LOG
 
 echo "$(date '+%F %T') 检测到断线，尝试自动登录" >> $LOG
 

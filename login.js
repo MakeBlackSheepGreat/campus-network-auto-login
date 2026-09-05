@@ -1,7 +1,15 @@
 #!/usr/bin/env node
-// 路由器版校园网自动登录（方案B）
-// 流程: headless Chromium(CDP) 打开门户 → 瑞数WAF握手 → 渲染登录表单
-//       → 截图验证码 → tesseract OCR → 填表提交 → 校验结果
+// 校园网自动登录示例脚本（方案B：路由器 headless Chromium）
+// 流程: headless Chromium(CDP) 首次直接打开认证登录页
+//       → 瑞数WAF握手(JS自动重试) → 渲染表单 → 截图验证码 → tesseract OCR
+//       → 填表提交 → 校验结果
+// 关键经验（2026-09-05 实测）:
+//  1) 直接首次导航登录页（unionautologin.do）：先访问门户主页会建立"脏会话"，
+//     之后所有后续请求被瑞数 WAF 以 400 拒绝（包括 fetch、iframe、导航）。
+//  2) 不注入 stealth（addScriptToEvaluateOnNewDocument 改写 navigator）：
+//     自定义 getter 会被瑞数识别，导致登录页握手失败（body 空）；不加反而成功。
+//  3) 认证页若为 IP 直连，可不停代理软件（redir-host/fake-ip 只劫持域名流量）。
+//  4) 每次登录清空 cookie + profile，避免复用旧会话 cookie 被拒。
 // 用法:
 //   node login.js <wlanuserip>          # 完整登录
 //   node login.js <wlanuserip> --dry    # 只测 导航+验证码+OCR，不提交
@@ -14,18 +22,20 @@ const http = require('http');
 const ACCOUNT = 'SCXY****************'; // 校园网账号（按学校要求带前缀，如 SCXY+手机号）
 const PASS = '****************';        // 密码（通常为手机号后六位，按学校实际）
 const BASE = 'http://218.200.239.185:8888'; // 校园网 Portal 地址（运营商公开地址，按学校实际）
-const PORTAL_PAGE = '/portalserver/scunioncmccgxsd29.jsp'; // 具体门户页面按学校实际
+// 认证登录页：brasip/redirectUrl/domain 为门户固定参数（可打开门户后从 frameset 的 iframe 地址抓取）
+const IFURL = BASE + '/portalserver/user/unionautologin.do?brasip=221.182.124.1&braslogoutip=&area=union&wlanuserip=' + '{WLANIP}' + '&redirectUrl=example/sccmcceducookie/cnunion&domain=@cmccgxsd&wlanparameter=null';
 const CDP_PORT = 9222;
-const CHROME = '/opt/alpine/usr/lib/chromium/chrome';
+const CHROME = '/opt/alpine/usr/lib/chromium/chrome'; // 按实际 Chromium 路径修改
 const PROFILE = '/tmp/chromeprof';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-const LD_LIB = '/opt/alpine/usr/lib:/opt/alpine/lib:/opt/alpine/usr/lib/pulseaudio';
+const LD_LIB = '/opt/alpine/usr/lib:/opt/alpine/lib:/opt/alpine/usr/lib/pulseaudio'; // 按实际环境调整
 const MAX_TRY = 4;
 const GLOBAL_TIMEOUT = 190000;
 
 const wlanip = process.argv[2];
 const DRY = process.argv.includes('--dry');
 if (!wlanip) { console.log('FAIL 缺少 wlanuserip 参数'); process.exit(1); }
+const LOGIN_URL = IFURL.replace('{WLANIP}', wlanip);
 
 // 互斥锁：防止并发实例争抢 CDP
 const LOCK = '/tmp/campus_login.lock';
@@ -53,11 +63,6 @@ function httpGetJson(path) {
   });
 }
 
-// ===== 内存释放/恢复（登录前释放高占用服务的内存，请按实际环境配置） =====
-// 内存紧张时 Chromium 无法启动，登录前暂停非必要的常驻服务（如代理类软件）
-// 以腾出内存，登录完成后恢复。服务名按实际环境填写，示例默认为空。
-const MEM_SERVICES = []; // 示例：[ 'service_a', 'service_b' ] 等 OpenWrt init 服务名
-
 function sh(cmd, timeoutMs) {
   return new Promise((resolve) => {
     execFile('/bin/sh', ['-c', cmd], { timeout: timeoutMs || 30000, maxBuffer: 1024 * 1024 },
@@ -65,28 +70,35 @@ function sh(cmd, timeoutMs) {
   });
 }
 
-// 登录前：暂停 MEM_SERVICES 里的服务 + 释放 page cache，腾出物理内存
+// ===== 内存释放/恢复（按实际环境配置） =====
+// 若认证页面为 IP 直连（不被代理的 redir/fake-ip 劫持），无需停代理服务；
+// 仅在内存不足以启动 Chromium 时才需要暂停高占用服务，登录后恢复。
+const MEM_SERVICES = []; // 示例：[ 'service_a', 'service_b' ] 等 OpenWrt init 服务名
+const ENABLE_KEY = '';   // 可选：uci 开关键，如 'openclash.config.enable'（登录时置 0，恢复置 1）
+
+// 登录前：清理旧 profile 与会话残留（复用旧 cookie 会被 WAF 拒绝）+ 释放内存
 async function freeMem() {
-  slog('释放内存：暂停高占用服务...');
-  let cmd = 'for w in $(pgrep -f watchdog); do kill -9 $w 2>/dev/null; done; ';
+  slog('清理环境（profile/缓存）...');
+  let cmd = 'killall chromium 2>/dev/null; rm -rf ' + PROFILE + '; ';
+  // 暂停高占用服务（若配置）
   for (const svc of MEM_SERVICES) {
-    cmd += `if [ -x /etc/init.d/${svc} ]; then /etc/init.d/${svc} stop >/dev/null 2>&1 & SPID=$!; sleep 15; kill -9 $SPID 2>/dev/null; fi; `;
+    cmd += `if [ -x /etc/init.d/${svc} ]; then ${ENABLE_KEY ? 'uci set ' + ENABLE_KEY.split('=')[0] + '=0; uci commit; ' : ''}timeout 18 /etc/init.d/${svc} stop >/dev/null 2>&1; fi; `;
   }
-  cmd += 'sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; echo done';
-  const r = await sh(cmd, 40000);
+  cmd += 'sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; echo clean_done';
+  const r = await sh(cmd, 25000);
   slog('  freeMem:', r.out);
-  await sleep(1000);
+  await sleep(500);
 }
 
 // 登录结束：恢复被暂停的服务（后台触发，不阻塞退出）
 function restoreServices() {
   for (const svc of MEM_SERVICES) {
     try {
-      const cp = spawn('/bin/sh', ['-c', `/etc/init.d/${svc} start >/dev/null 2>&1 &`], { detached: true, stdio: 'ignore' });
+      const cp = spawn('/bin/sh', ['-c', `${ENABLE_KEY ? 'uci set ' + ENABLE_KEY.split('=')[0] + '=1; uci commit; ' : ''}/etc/init.d/${svc} start >/dev/null 2>&1 &`], { detached: true, stdio: 'ignore' });
       cp.unref();
     } catch (e) {}
   }
-  slog('已触发服务恢复');
+  if (MEM_SERVICES.length) slog('已触发服务恢复');
 }
 
 // ---------- CDP 客户端 ----------
@@ -125,10 +137,13 @@ class Cdp {
 async function ensureChrome() {
   try { await httpGetJson('/json/version'); return; } catch (e) {}
   console.log('启动 headless Chromium...');
-  // single-process: 单进程模式，大幅降低内存占用（低内存设备关键）
+  // 参数为实测成功组合：
+  //  - --disable-gpu --disable-software-rasterizer：低端设备跑瑞数 Canvas/WebGL 指纹的稳定组合
+  //  - --disable-blink-features=AutomationControlled：隐藏 webdriver 自动化特征
+  //  - 不要注入 stealth（addScriptToEvaluateOnNewDocument 改写 navigator 会被瑞数识别）
   const args = ['--headless=new', '--single-process', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
     '--disable-software-rasterizer', '--disable-crash-reporter', '--disable-extensions', '--disable-sync', '--disable-background-networking',
-    '--disable-component-update', '--metrics-recording-only',
+    '--disable-component-update', '--metrics-recording-only', '--disable-blink-features=AutomationControlled',
     '--js-flags=--max-old-space-size=128', '--user-data-dir=' + PROFILE,
     '--remote-debugging-port=' + CDP_PORT, '--window-size=1280,720', '--user-agent=' + UA, 'about:blank'];
   const child = spawn(CHROME, args, { detached: true, stdio: 'ignore', env: Object.assign({}, process.env, { LD_LIBRARY_PATH: LD_LIB }) });
@@ -261,7 +276,7 @@ async function captchaToCode(cdp) {
 }
 
 // ---------- 页面流程 ----------
-async function waitEval(cdp, expr, tries = 40, gap = 500) {
+async function waitEval(cdp, expr, tries = 30, gap = 500) {
   for (let i = 0; i < tries; i++) {
     try { if (await cdp.eval(expr)) return true; } catch (e) {}
     await sleep(gap);
@@ -272,39 +287,44 @@ async function waitEval(cdp, expr, tries = 40, gap = 500) {
 async function main() {
   // 全局超时保护：避免内存压力下无限挂起
   const guard = setTimeout(() => { console.log('GLOBAL_TIMEOUT_' + GLOBAL_TIMEOUT / 1000 + 's'); finish(9); }, GLOBAL_TIMEOUT);
-  await freeMem(); // 释放内存，否则低内存下 Chromium 无法启动
+  await freeMem();
   await ensureChrome();
   const cdp = await Cdp.connect(await getPageWs());
   await cdp.send('Page.enable');
   await cdp.send('Runtime.enable');
-  cdp.onEvent = (msg) => {
-    if (msg.method === 'Page.javascriptDialogOpening') {
-      cdp.send('Page.handleJavaScriptDialog', { accept: true }).catch(() => {});
-    }
-  };
+  await cdp.send('Network.enable'); // 清 cookie 用
 
-  const portalUrl = BASE + PORTAL_PAGE + '?wlanuserip=' + wlanip + '&wlanacname=';
-  console.log('打开门户:', portalUrl);
-  await cdp.send('Page.navigate', { url: portalUrl });
+  // 首次直接导航登录页：清 cookie → 202 握手页 → 瑞数 JS 自动重试 → 200 表单
+  // 注意：不能先访问门户主页再跳这里（实测主页会话残留 → 后续请求全 400）
+  await cdp.send('Network.clearBrowserCookies');
+  console.log('打开登录页:', LOGIN_URL.replace(wlanip, '****'));
+  await cdp.send('Page.navigate', { url: LOGIN_URL });
 
-  // 等 frameset 里的 unionautologin iframe
-  let iframeUrl = null;
-  for (let i = 0; i < 40; i++) {
-    await sleep(500);
+  // 等验证码出现（瑞数自动重试渲染约 3-10s）
+  if (!(await waitEval(cdp, `!!document.getElementById('randomimage')`))) {
+    // 诊断：抓取页面现场
     try {
-      const src = await cdp.eval(`(() => { const f = document.querySelector('frame'); return f ? f.src : null; })()`);
-      if (src && src.indexOf('unionautologin') >= 0) { iframeUrl = src; break; }
-    } catch (e) {}
+      const pageDiag = await cdp.eval(`(() => {
+        const d = document;
+        return {
+          url: (d.location.href || '').slice(0, 120),
+          title: (d.title || '').slice(0, 80),
+          cookie: (d.cookie || '').slice(0, 200),
+          bodyLen: (d.body ? d.body.innerHTML.length : 0),
+          head: (d.documentElement ? d.documentElement.outerHTML : '').replace(/\\s+/g, ' ').slice(0, 200)
+        };
+      })()`);
+      console.log('DIAG 登录页未渲染现场:', JSON.stringify(pageDiag, null, 1));
+    } catch (pd) { console.log('DIAG 页面eval不可用:', pd.message); }
+    throw new Error('登录表单未渲染（瑞数握手失败）');
   }
-  if (!iframeUrl) throw new Error('获取登录 iframe 失败（瑞数WAF可能未通过）');
-  console.log('登录iframe:', iframeUrl);
+  console.log('登录表单已渲染，验证码就绪');
 
-  await cdp.send('Page.navigate', { url: iframeUrl });
-  if (!(await waitEval(cdp, `!!document.getElementById('randomimage')`))) throw new Error('登录表单未渲染');
-
+  // 刷新验证码/失败重试：清 cookie → 重新导航登录页（全新会话）
   const reloadForm = async () => {
     await sleep(500);
-    await cdp.send('Page.navigate', { url: iframeUrl });
+    try { await cdp.send('Network.clearBrowserCookies'); } catch (e) {}
+    await cdp.send('Page.navigate', { url: LOGIN_URL });
     await waitEval(cdp, `!!document.getElementById('randomimage')`);
   };
 
@@ -326,18 +346,17 @@ async function main() {
     })()`);
     console.log('提交:', filled);
 
-    // 等结果
+    // 等结果（表单提交后浏览器导航到结果页，轮询当前文档文本）
     let outcome = 'timeout';
     for (let i = 0; i < 40; i++) {
       await sleep(500);
       try {
-        const txt = await cdp.eval(`(function(){ const f = document.querySelector('frame'); let s = ''; try { if (f && f.contentDocument && f.contentDocument.body) s = f.contentDocument.body.innerText; } catch(e) {} s += document.body ? document.body.innerText : ''; s += '|TITLE:' + document.title; return s; })()`);
+        const txt = await cdp.eval(`(function(){ let s = ''; try { s = document.body ? document.body.innerText : ''; } catch(e) {} return s + '|TITLE:' + document.title; })()`);
         const t2 = txt.replace(/\s+/g, '');
         slog('  resp[' + i + ']:', t2.slice(0, 200));
         if (/尊敬的用户|已经在线|注销|登录成功|在线.*\d{2}:\d{2}/.test(t2)) { outcome = 'ok'; break; }
         if (/验证码错误|验证码不正确|验证码.*错误|验证码输入/.test(t2)) { outcome = 'captcha'; break; }
         if (/密码错误|密码不正确|密码不对|账号.*错误|用户名.*错误/.test(t2)) { outcome = 'fail'; break; }
-        // 登录失败页：frame 详细文本加载较慢（约2s），等若干轮再判定为账号/密码错误
         if (/登录失败/.test(t2) && i >= 10) { outcome = 'fail'; break; }
       } catch (e) { slog('  eval异常:', e.message); }
     }
@@ -359,4 +378,19 @@ function finish(code) {
   setTimeout(() => process.exit(code), 3000);
 }
 main().then(finish)
-      .catch((e) => { console.log('LOGIN_FAIL', e.message); finish(1); });
+      .catch(async (e) => {
+        console.log('LOGIN_FAIL', e.message);
+        // ===== 失败现场诊断（下次断线定位失败环节用）=====
+        try {
+          const d = {};
+          try {
+            const l = await httpGetJson('/json/list');
+            d.page = (l || []).map(p => ({ url: (p.url || '').slice(0, 90), title: (p.title || '').slice(0, 60) }));
+            d.chrome_cdp = '可达';
+          } catch (x) { d.chrome_cdp = '不可达（Chromium 未起或已崩）'; }
+          d.portal = (await sh('curl -s -m 6 -o /dev/null -w "portal_http=%{http_code}" ' + BASE + '/ 2>&1', 10000)).out;
+          d.mem = (await sh('grep MemAvailable /proc/meminfo', 8000)).out;
+          console.log('DIAG 失败现场:', JSON.stringify(d, null, 1));
+        } catch (de) { console.log('DIAG 诊断失败:', de.message); }
+        finish(1);
+      });
